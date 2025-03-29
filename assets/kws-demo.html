@@ -77,8 +77,8 @@
             // const modelJSON = await response.json();
 
             // // 检查并修复输入层
-            // if (modelJSON.modelTopology && 
-            //     modelJSON.modelTopology.model_config && 
+            // if (modelJSON.modelTopology &&
+            //     modelJSON.modelTopology.model_config &&
             //     modelJSON.modelTopology.model_config.config &&
             //     modelJSON.modelTopology.model_config.config.layers &&
             //     modelJSON.modelTopology.model_config.config.layers.length > 0) {
@@ -245,7 +245,7 @@
                 let resampledMonoAudio = await resampleAndMakeMono(audioEvent.inputBuffer);
                 arrayBuffer = [...arrayBuffer, ...resampledMonoAudio]
                 batchSize = Math.floor(arrayBuffer.length / windowBufferSize)
-                // if we got batches * 750 ms seconds of buffer 
+                // if we got batches * 750 ms seconds of buffer
                 let batchMels = []
                 if (arrayBuffer.length >= numOfBatches * windowBufferSize) {
                     let batch = 0

@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebSocket Vosk Speech Recognition</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="kws.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/normalize/8.0.1/normalize.min.css">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            /*background-color: #f4f4f4;*/
+            margin: 0;
+            padding: 0;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+        }
+
+        header {
+            background-color: #333;
+            color: #fff;
+            padding: 1rem;
+            text-align: center;
+        }
+
+        h1 {
+            margin: 0;
+        }
+
+        .controls {
+            display: flex;
+            justify-content: center;
+            margin-bottom: 1.5rem;
+        }
+
+        button {
+            background-color: #007bff;
+            border: none;
+            color: #fff;
+            padding: 0.75rem 1.5rem;
+            text-align: center;
+            text-decoration: none;
+            display: inline-block;
+            font-size: 16px;
+            margin: 0 0.5rem;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: background-color 0.3s ease;
+        }
+
+        button:hover {
+            background-color: #0056b3;
+        }
+
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+
+        #start {
+            background-color: coral;
+        }
+
+        #start:disabled {
+            color: #ccc;
+        }
+
+        #start.active {
+            background-color: #2ecc71;
+            color: #fff;
+        }
+
+        #output {
+            background-color: #fff;
+            border: 1px solid #ddd;
+            padding: 1rem;
+            border-radius: 4px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+
+          display: flex;
+          flex-direction: column;
+          margin-top: 1.5rem;
+        }
+        /* 请求和响应的 div 框样式 */
+        .response-item {
+          background-color: #fff;
+          border: 1px solid #ddd;
+          border-radius: 4px;
+          box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+          padding: 1rem;
+          margin-bottom: 1rem;
+          font-size: 14px;
+          line-height: 1.5;
+        }
+
+        .response-item.request {
+          background-color: #f4f4f4;
+        }
+
+        .response-item.response {
+          background-color: #f8f8f8;
+        }
+
+        .response-item .label {
+          font-weight: bold;
+          margin-right: 0.5rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Vosk Speech Recognition</h1>
+    <button id="start">Start Recording</button>
+    <button id="stop" disabled>Stop Recording</button>
+    <p id="output"></p>
+
+    <script>
+        let mediaRecorder;
+        let audioChunks = [];
+        let websocket;
+        var recognizer;
+        let isRecording = false;
+        let isServerRecognizerActive = false;
+
+        const WINDOW_SIZE = 200
+        const SLIDE_WINDOW_SIZE = 50
+        const numOfBatches = 1
+        const SPEC_HOP_LENGTH = 256
+        const MEL_SPEC_BINS = 40
+        const NUM_FFTS = 512
+        const LOG_OFFSET = 1e-4
+        const wakeWord = "小丁";
+        let wakeWordStage = -1;
+        let wakeWordStageCounter = 0;
+
+        const detectionThreshold = 0.55;
+
+        const windowBufferSize = WINDOW_SIZE / 1000 * SAMPLE_RATE
+        const slideWindowBufferSize = SLIDE_WINDOW_SIZE / 1000 * SAMPLE_RATE
+        const wakeWordMaxGap = 20;   // Gap = n * slideWindow
+
+        const cpuMel = new MelSpectrogram({
+            sampleRate: SAMPLE_RATE,
+            hopLength: SPEC_HOP_LENGTH,
+            n_mels: MEL_SPEC_BINS,
+            nFft: NUM_FFTS,
+            winLength: NUM_FFTS,
+            f_min: 0,
+            f_max: 8000,
+            n_stft: Math.floor(NUM_FFTS / 2) + 1,
+            norm: 'slaney',
+            mel_scale: 'htk'
+        });
+
+        async function init() {
+            model = await tf.loadLayersModel('kws_js/model.json');
+        }
+        window.addEventListener("load", init);
+
+
+        document.getElementById('start').addEventListener('click', async () => {
+            const mediaStream = await navigator.mediaDevices.getUserMedia({
+                video: false,
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: true,
+                    channelCount: 1,
+                    sampleRate: 16000
+                },
+            });
+
+            // 初始化 AudioContext
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                sampleRate: SAMPLE_RATE
+            });
+            let arrayBuffer = [];
+            const recognizerNode = audioContext.createScriptProcessor(4096, 1, 1)
+            recognizerNode.onaudioprocess = async (event) => {
+                if (!isRecording)
+                    return;
+                try {
+                    if (isServerRecognizerActive)
+                    {
+                        for (chunk in audioChunks)
+                        {
+                            websocket.send(chunk);
+                        }
+                        websocket.send(event.inputBuffer.getChannelData(0));
+                        audioChunks = [];
+                    } else {
+                        let resampledMonoAudio = await resampleAndMakeMono(event.inputBuffer);
+                        arrayBuffer = [...arrayBuffer, ...resampledMonoAudio]
+                        let batchSize = Math.floor(arrayBuffer.length / windowBufferSize)
+                        let batchMels = []
+                        if (arrayBuffer.length >= numOfBatches * windowBufferSize) {
+                            let batch = 0
+                            for (; arrayBuffer.length > windowBufferSize;) {
+                                batchBuffer = arrayBuffer.slice(0, windowBufferSize)
+                                arrayBuffer = arrayBuffer.slice(slideWindowBufferSize)
+
+                                // calculate log mels
+                                let mel_result = cpuMel.forward(batchBuffer, LOG_OFFSET);
+                                melSpec = mel_result;
+                                let log_mels = tf.stack(mel_result).expandDims(2)
+                                batchMels.push(log_mels)
+                                batch = batch + 1
+                            }
+
+                            // Run model with Tensor inputs and get the result.
+                            let outputTensor = tf.tidy(() => {
+                                inputTensor = tf.stack(batchMels)
+                                // let inputTensor = tf.tensor(dataProcessed, [batch, MEL_SPEC_BINS, dataProcessed.length/(batch * MEL_SPEC_BINS), 1], 'float32');
+                                let outputTensor = model.predict(inputTensor);
+                                inputTensor.dispose();
+                                return outputTensor
+                            });
+                            let outputData = await outputTensor.data();
+                            batchMels.forEach((mels) => mels.dispose());
+                            outputTensor.dispose();
+
+                            for (var batch_ = 0; batch_ < batch; batch_++)
+                            {
+                                const classSize = outputData.length / batch;
+                                const batchData = Array.from(outputData).slice(classSize * batch_, classSize * (batch_ + 1));
+
+                                let probs = softmax(batchData);
+                                let class_idx = argMax(probs);
+
+                                const isAllWordOverThreshold = batchData.slice(0, -1).reduce((a, b) => b > detectionThreshold ? a+1 : 0, 0) == batchData.length - 1;
+                                let isWordOrderMatchThreshold = false;
+                                // Match by probe
+                                if (class_idx == probs.length - 1)
+                                {
+                                    // Not matched
+                                    if (wakeWordStage != -1)
+                                    {
+                                        wakeWordStageCounter++;
+                                    }
+                                    if (wakeWordStageCounter > wakeWordMaxGap)
+                                    {
+                                        wakeWordStage = -1;
+                                        wakeWordStageCounter = 0;
+                                    }
+                                } else {
+                                    let wakeWordProbability = batchData[class_idx];
+                                    // match words
+                                    if (class_idx == wakeWordStage || class_idx == wakeWordStage + 1)
+                                    {
+                                        if (wakeWordProbability > detectionThreshold)
+                                        {
+                                            wakeWordStage = class_idx;
+                                            wakeWordStageCounter = 0;
+                                            isWordOrderMatchThreshold = wakeWordStage == classSize - 2;
+                                        }
+                                    }
+                                }
+
+                                if (isWordOrderMatchThreshold || isAllWordOverThreshold)
+                                {
+                                    let wakeWordProbability = batchData.slice(0, -1).reduce((a, b) => b > a ? b : a, 0);
+                                    console.log(`检测到唤醒词，概率: ${wakeWordProbability.toFixed(4)}`);
+                                    isServerRecognizerActive = true;
+                                    document.getElementById("start").classList.add("active");
+                                }
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error('acceptWaveform failed', error)
+                }
+            }
+            const source = audioContext.createMediaStreamSource(mediaStream);
+            source.connect(recognizerNode);
+            recognizerNode.connect(audioContext.destination);
+
+            // const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/wave' });
+
+            // mediaRecorder.ondataavailable = (event) => {
+            //     if (event.data.size > 0) {
+            //         audioChunks.push(event.data);
+            //         const reader = new FileReader();
+            //         reader.onload = () => {
+            //             const arrayBuffer = reader.result;
+            //             console.log("started")
+            //             websocket.send(arrayBuffer);
+            //         };
+            //         reader.readAsArrayBuffer(event.data);
+            //     }
+            // };
+
+            // mediaRecorder.start(1000); // 每 1000ms 发送一次数据
+            document.getElementById('start').disabled = true;
+            document.getElementById('stop').disabled = false;
+            isRecording = true;
+        });
+
+        document.getElementById('stop').addEventListener('click', () => {
+            isRecording = false;
+            document.getElementById('start').disabled = false;
+            document.getElementById('stop').disabled = true;
+        });
+
+        function load_websocket()
+        {
+            websocket = new WebSocket('llm_ws');
+
+            const keepalive_msg = () => {
+                websocket.send(JSON.stringify({"type": "keepalive"}));
+                setTimeout(() => keepalive_msg, 10000);
+            }
+
+            var request_div = undefined;
+            var response_div = undefined;
+            websocket.onmessage = (event) => {
+                try {
+                    const result = JSON.parse(event.data);
+
+                    if (result.type == "partial_result" || result.type == "recognizing")
+                    {
+                        if (request_div === undefined)
+                        {
+                            request_div = document.createElement("div");
+                            request_div.classList.add("request");
+                            request_div.classList.add("request-item");
+                            document.getElementById('output').appendChild(request_div);
+                        }
+                        request_div.innerText = result.text+"\n";
+                        if (result.is_final)
+                        {
+                            request_div = undefined;
+                        }
+                    } else if (result.type == "ai_response")
+                    {
+                        if (response_div === undefined)
+                        {
+                            response_div = document.createElement("div");
+                            response_div.classList.add("response");
+                            response_div.classList.add("response-item");
+                            document.getElementById('output').appendChild(response_div);
+                        }
+                        response_div.innerText = result.text+"\n";
+                        if (result.is_final)
+                        {
+                            response_div = undefined;
+                        }
+                    } else if (result.type == "idle")
+                    {
+                        isServerRecognizerActive = false;
+                        serverIdentifyTime = 0;
+                        document.getElementById("start").classList.remove("active");
+                    }
+                } catch(e)
+                {
+
+                }
+            };
+
+            websocket.onopen = () => {
+                console.log('WebSocket connection established');
+            };
+
+            websocket.onclose = () => {
+                console.log('WebSocket connection closed');
+                setTimeout(() => load_websocket(), 1000);
+            };
+        }
+        load_websocket();
+    </script>
+</body>
+</html>
