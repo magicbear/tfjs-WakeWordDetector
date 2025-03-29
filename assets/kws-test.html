@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <script src="kws.js"></script>
+    <title>Wave文件加载器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .container {
+            border: 1px solid #ddd;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        button {
+            padding: 8px 16px;
+            background: #4285f4;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+        }
+        button:disabled {
+            background: #cccccc;
+        }
+        .controls {
+            margin-top: 20px;
+        }
+        .waveform {
+            width: 100%;
+            height: 150px;
+            background: #f5f5f5;
+            margin-top: 20px;
+            position: relative;
+        }
+        .file-info {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Wave文件加载器</h1>
+    <div class="container">
+        <input type="file" id="waveFileInput" accept=".wav">
+        <audio type="file" id="audio" controls></audio>
+        <div class="file-info" id="fileInfo">未选择文件</div>
+        <fieldset style="display:flex">
+            <legend>Audio Data</legend>
+            <textarea style="flex: auto" rows="10" id="audio_data"></textarea>
+        </fieldset>
+        <fieldset style="display:flex">
+            <legend>Processed Data</legend>
+            <textarea style="flex: auto" rows="10" id="processed_data"></textarea>
+        </fieldset>
+        <div class="controls">
+            <button id="playBtn" disabled>播放</button>
+            <button id="pauseBtn" disabled>暂停</button>
+            <button id="stopBtn" disabled>停止</button>
+        </div>
+        <div class="waveform" id="waveform"></div>
+    </div>
+    <script>
+    // 全局变量
+    let audioContext;
+    let audioBuffer;
+    let sourceNode;
+    let isPlaying = false;
+    let startTime = 0;
+    let pausedAt = 0;
+
+    const zmuv_mean = 0
+    const zmuv_std = 1
+    const log_offset = 1e-7
+
+    const audioFloatSize = 32767
+    const windowSize = 600
+    const numOfBatches = 1
+    const SPEC_HOP_LENGTH = 256
+    const MEL_SPEC_BINS = 40
+    const NUM_FFTS = 512
+
+    // 获取DOM元素
+    const fileInput = document.getElementById('waveFileInput');
+    const fileInfo = document.getElementById('fileInfo');
+    const playBtn = document.getElementById('playBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const waveformContainer = document.getElementById('waveform');
+
+    var model;
+
+    // 初始化AudioContext
+    function initAudioContext() {
+        if (!audioContext) {
+            audioContext = new(window.AudioContext || window.webkitAudioContext)({
+                sampleRate: 16000
+            });
+        } else if (audioContext.state === 'suspended') {
+            audioContext.resume();
+        }
+    }
+
+
+
+    var run_cpu = false;
+    async function bufferProcess(resampledMonoAudio, st = 0) {
+        const windowBufferSize = windowSize / 1000 * 16000;
+
+        batchBuffer = new Float32Array(windowBufferSize);
+        batchBuffer.set(resampledMonoAudio.slice(st, st + windowBufferSize), 0)
+
+        const tfMel = new TfMelSpectrogram({
+            sampleRate: 16000,
+            hopLength: SPEC_HOP_LENGTH,
+            n_mels: MEL_SPEC_BINS,
+            nFft: NUM_FFTS,
+            winLength: NUM_FFTS,
+            f_min: 0,
+            f_max: 8000,
+            n_stft: Math.floor(NUM_FFTS / 2) + 1,
+            norm: 'slaney',
+            mel_scale: 'htk'
+        });
+
+        const cpuMel = new MelSpectrogram({
+            sampleRate: 16000,
+            hopLength: SPEC_HOP_LENGTH,
+            n_mels: MEL_SPEC_BINS,
+            nFft: NUM_FFTS,
+            winLength: NUM_FFTS,
+            f_min: 0,
+            f_max: 8000,
+            n_stft: Math.floor(NUM_FFTS / 2) + 1,
+            norm: 'slaney',
+            mel_scale: 'htk'
+        });
+
+
+        // var t1 = new Date().getTime();
+        // var result;
+        // if (run_cpu)
+        // {
+        // // console.log(result);
+        //     // console.info("usage time " , new Date().getTime() - t1)
+        // } else 
+        // {
+        //     tfMel.forward(batchBuffer).then(async (r) => {
+        //         result = await calcModelResult(r);
+        //         r.dispose();
+        //         // console.log(result);
+        //         // console.info("usage time " , new Date().getTime() - t1)
+        //     });
+        // }
+        const mel_spec = cpuMel.forward(batchBuffer);
+        console.log(mel_spec.shape)
+        var melSpec = await mel_spec.array();
+        mel_spec.dispose();
+        // return data;
+        return melSpec.map((x) => Array.from(x));
+    }
+
+    async function calcModelResult(dataProcessed) {
+        let batch = 1;
+
+        let outputTensor = tf.tidy(() => {
+            var inputTensor;
+            if (dataProcessed instanceof tf.Tensor)
+            {
+                inputTensor = dataProcessed.expandDims(2).expandDims(0);
+            } else 
+            {
+                if (dataProcessed[0] instanceof Array)
+                {
+                    inputTensor = tf.stack(dataProcessed).expandDims(2).expandDims(0);
+                } else 
+                {
+                    inputTensor = tf.tensor(dataProcessed, [batch, MEL_SPEC_BINS, dataProcessed.length / (batch * MEL_SPEC_BINS), 1], 'float32');
+                }
+            }
+            let outputTensor = model.predict(inputTensor);
+            inputTensor.dispose();
+            return outputTensor
+        });
+        let outputData = await outputTensor.data();
+        outputTensor.dispose();
+        return outputData;
+    }
+
+    window.addEventListener("load", async () => {
+        model = await tf.loadLayersModel('kws_js/model.json'); //tf.io.fromMemory(modelJSON));
+    });
+
+    document.getElementById("audio_data").addEventListener("change", async (event) => {
+        const audioData = JSON.parse(event.srcElement.value);
+        const audioBuffer = new Float32Array(audioData);
+        console.log(audioBuffer.length);
+        const dataProcessed = await bufferProcess(audioBuffer);
+        document.getElementById("processed_data").value = JSON.stringify(dataProcessed);
+        // calcModelResult(bufferProcess(audioBuffer));
+    });
+
+
+    document.getElementById("processed_data").addEventListener("change", async (event) => {
+        const batch = 1;
+        const audioData = JSON.parse(event.srcElement.value);
+        // const dataProcessed = new Float32Array(audioData);
+        console.log(await calcModelResult(audioData));
+    });
+
+    // 文件选择处理
+    fileInput.addEventListener('change', async (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        initAudioContext();
+
+        fileInfo.textContent = `加载中: ${file.name}`;
+
+        try {
+            // 读取文件
+            const arrayBuffer = await file.arrayBuffer();
+
+            // 解码音频数据
+            audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+            let resampledMonoAudio = await resampleAndMakeMono(audioBuffer);
+            await calcModelResult(await bufferProcess(resampledMonoAudio, Math.floor(0.5 * 16000)));
+
+            //     const htmlAudioElement = document.getElementById("audio");
+            //     file.arrayBuffer().then(buffer => {
+            //     htmlAudioElement.src = URL.createObjectURL(new Blob([buffer], {'type': "audio/wav"}));
+
+            //       const source = audioContext.createMediaElementSource(htmlAudioElement);
+
+            //       source.connect(audioContext.destination);
+
+            //     // 初始化Meyda用于音频特征提取
+            //     mfccProcessor = Meyda.createMeydaAnalyzer({
+            //         audioContext: audioContext,
+            //         source: source,
+            //         bufferSize: 512,
+            //         hopSize: 256,
+            //         sampleRate: 16000,
+            //         numberOfMFCCCoefficients: 40, // 明确指定需要的MFCC系数数量
+            //         featureExtractors: ['mfcc'],
+            //         callback: (features) => {
+            //             if (!htmlAudioElement.paused)
+            //                 console.log(features.mfcc.reduce((a,b) => a+b, 0));
+            //         }
+            //     });
+
+            //     // 开始特征提取
+            //     mfccProcessor.start();
+
+            // })
+
+
+            // 显示文件信息
+            const duration = audioBuffer.duration.toFixed(2);
+            const channels = audioBuffer.numberOfChannels;
+            const sampleRate = audioBuffer.sampleRate;
+
+            fileInfo.textContent = `${file.name} | 时长: ${duration}秒 | 通道: ${channels} | 采样率: ${sampleRate}Hz`;
+
+            // 绘制波形
+            drawWaveform(audioBuffer);
+
+            // 启用控制按钮
+            playBtn.disabled = false;
+            pauseBtn.disabled = true;
+            stopBtn.disabled = true;
+
+        } catch (error) {
+            console.error('加载音频失败:', error);
+            fileInfo.textContent = `加载失败: ${error.message}`;
+        }
+    });
+
+    // 播放音频
+    playBtn.addEventListener('click', () => {
+        if (!audioBuffer) return;
+
+        if (isPlaying) {
+            if (sourceNode) {
+                sourceNode.stop();
+            }
+        }
+
+        // 创建音频源
+        sourceNode = audioContext.createBufferSource();
+        sourceNode.buffer = audioBuffer;
+        sourceNode.connect(audioContext.destination);
+
+        // 处理播放结束事件
+        sourceNode.onended = () => {
+            isPlaying = false;
+            pausedAt = 0;
+            playBtn.disabled = false;
+            pauseBtn.disabled = true;
+            stopBtn.disabled = true;
+        };
+
+        // 开始播放
+        const offset = pausedAt;
+        sourceNode.start(0, offset);
+        startTime = audioContext.currentTime - offset;
+        isPlaying = true;
+
+        // 更新按钮状态
+        playBtn.disabled = true;
+        pauseBtn.disabled = false;
+        stopBtn.disabled = false;
+    });
+
+    // 暂停播放
+    pauseBtn.addEventListener('click', () => {
+        if (!isPlaying || !sourceNode) return;
+
+        sourceNode.stop();
+        pausedAt = audioContext.currentTime - startTime;
+        isPlaying = false;
+
+        // 更新按钮状态
+        playBtn.disabled = false;
+        pauseBtn.disabled = true;
+        stopBtn.disabled = false;
+    });
+
+    // 停止播放
+    stopBtn.addEventListener('click', () => {
+        if (!sourceNode) return;
+
+        sourceNode.stop();
+        isPlaying = false;
+        pausedAt = 0;
+
+        // 更新按钮状态
+        playBtn.disabled = false;
+        pauseBtn.disabled = true;
+        stopBtn.disabled = true;
+    });
+
+    // 绘制波形
+    function drawWaveform(buffer) {
+        const width = waveformContainer.clientWidth;
+        const height = waveformContainer.clientHeight;
+
+        // 清除之前的内容
+        waveformContainer.innerHTML = '';
+
+        // 创建canvas
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        waveformContainer.appendChild(canvas);
+
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, width, height);
+
+        // 获取音频数据
+        const channelData = buffer.getChannelData(0);
+        const step = Math.ceil(channelData.length / width);
+
+        ctx.beginPath();
+        ctx.strokeStyle = '#2196F3';
+        ctx.lineWidth = 2;
+
+        // 绘制波形
+        for (let i = 0; i < width; i++) {
+            const index = Math.floor(i * step);
+            let min = 1.0;
+            let max = -1.0;
+
+            // 查找每个步长内的最小值和最大值
+            for (let j = 0; j < step; j++) {
+                const datum = channelData[index + j];
+                if (datum < min) min = datum;
+                if (datum > max) max = datum;
+            }
+
+            const y1 = (1 + min) * height / 2;
+            const y2 = (1 + max) * height / 2;
+
+            // 绘制垂直线从最小值到最大值
+            ctx.moveTo(i, y1);
+            ctx.lineTo(i, y2);
+        }
+
+        ctx.stroke();
+    }
+    </script>
+</body>
+
+</html>
